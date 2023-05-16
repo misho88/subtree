@@ -1,0 +1,552 @@
+#!/usr/bin/env python3
+
+from sys import stdin, stdout, stderr
+from os import linesep
+from argparse import ArgumentParser
+import re
+from typing import Any
+from dataclasses import dataclass
+from collections import deque
+from itertools import chain
+from functools import update_wrapper, partial
+from collections.abc import Callable
+from termcolor import colored
+
+
+class SliceMaker:
+    def __getitem__(self, arg):
+        return arg
+
+
+S = SliceMaker()
+
+
+def none(*args, **kwargs):
+    return
+
+
+def pack(*args):
+    return args
+
+
+def wrapped(f):
+    '''try dig out the original function out of a wrapper/partial/decorator'''
+    if isinstance(f, partial):
+        return wrapped(f.func)
+    if hasattr(f, '__wrapped__'):
+        return wrapped(f.__wrapped__)
+    return f
+
+
+def debug(*args, file=stderr, **kwargs):
+    '''print to standard error'''
+    return print(*args, file=file, **kwargs)
+
+
+def reversed_enumerate(seq):
+    '''like reversed(enumerate(seq)) except it works'''
+    return zip(reversed(range(len(seq))), reversed(seq))
+
+
+class Node:
+    '''node of a tree'''
+    def __init__(self, value, children=()):
+        '''initialize the node with some value and child nodes'''
+        self.value, self.children = value, list(children)
+
+    @classmethod
+    def cast(cls, item):
+        '''return item as a Node if it isn't already'''
+        return item if isinstance(item, cls) else cls(item)
+
+    def __repr__(self):
+        '''repr of the node'''
+        name = type(self).__name__
+        args = repr(self.value)
+        if self.children:
+            args = f'{args}, {repr(self.children)}'
+        return f'{name}({args})'
+
+    def __getitem__(self, idx):
+        '''index the tree
+
+        self[i,j,...] is the same as self.children[i].children[j]...
+        '''
+        if isinstance(idx, int):
+            return self.children[idx]
+        if isinstance(idx, (list, tuple)):
+            if not idx:
+                return self
+            i, *rest = idx
+            return self.children[i][rest]
+        raise IndexError(f'bad index: {repr(idx)}')
+
+    class get:
+        '''functions for returning data while traversing a tree
+
+        Each function takes the arguments:
+            parent: the parent node
+            index: the child node's index
+            child: the child node (i.e., parent.children[index] is child)
+            previous: what the function returned when it was called on the
+                      parent
+        It also has a .default attribute which is the root node's "previous"
+        argument.
+        '''
+        class Combined:
+            '''make combinations of functions from this class'''
+            def __init__(self, *funcs):
+                self.funcs = funcs
+                self.default = lambda node: tuple(
+                    getattr(wrapped(func), 'default', none)(node)
+                    for func in funcs
+                )
+
+            def __call__(self, parent, index, node, previous):
+                return tuple(
+                    func(parent, index, node, prev)
+                    for func, prev in zip(self.funcs, previous)
+                )
+
+            def __iter__(self):
+                yield from self.funcs
+
+        class Combinable:
+            '''make combinations of functions with the & operator
+
+            Combinable(a) & Combinable(b) is the same as Combined(a, b)
+            '''
+            def __init__(self, func):
+                update_wrapper(self, func)
+                self.__wrapped__ = func  # certainly redundant
+
+            def __call__(self, parent, index, node, previous):
+                return self.__wrapped__(parent, index, node, previous)
+
+            def __and__(self, other):
+                if isinstance(other, Node.get.Combined):
+                    return Node.get.Combined(self, *other)
+                return Node.get.Combined(self, other)
+
+            def __rand__(self, other):
+                if isinstance(other, Node.get.Combined):
+                    return Node.get.Combined(*other, self)
+                return Node.get.Combined(other, self)
+
+        def with_attrs(**kwargs):
+            '''monkey-patch in new attributes'''
+            def inner(f):
+                for k, v in kwargs.items():
+                    setattr(f, k, v)
+                return f
+            return inner
+
+        @staticmethod
+        @Combinable
+        @with_attrs(default=lambda node: node)  # type: ignore
+        def node(parent, index, node, previous):
+            '''get the node object itself'''
+            return node
+
+        @staticmethod
+        @Combinable
+        @with_attrs(default=lambda node: None)  # type: ignore
+        def parent(parent, index, node, previous):
+            '''get the parent of the node itself'''
+            return parent
+
+        @staticmethod
+        @Combinable
+        @with_attrs(default=lambda node: True)  # type: ignore
+        def is_last(parent, index, node, previous):
+            '''get whether or not this is the last child'''
+            return node is parent.children[-1]
+
+        @staticmethod
+        @Combinable
+        @with_attrs(default=lambda node: node.value)  # type: ignore
+        def value(parent, index, node, previous):
+            '''get the node's value'''
+            return node.value
+
+        @staticmethod
+        @Combinable
+        @with_attrs(default=lambda node: ())  # type: ignore
+        def indices(parent, index, node, previous):
+            '''get the indices of the node relative to the root node'''
+            return pack(*previous, index)
+
+        @staticmethod
+        @Combinable
+        @with_attrs(default=lambda node: 0)  # type: ignore
+        def depth(parent, index, node, previous):
+            '''get the depth of the node'''
+            return previous + 1
+
+        @staticmethod
+        @Combinable
+        @with_attrs(default=lambda node: ())  # type: ignore
+        def everything(parent, index, node, previous):
+            '''get the parent, index, node and previous resuls'''
+            return parent, index, node, previous
+
+    def traverse(self, *, breadth=False, get=get.node, default=None):
+        '''traverse the tree
+
+        breadth: breadth-first if True, depth-first if False (default)
+        get: what to return from each node; should be a function of the form
+             get(parent, index, child, prev); Node.get has a number of useful
+             functions of this sort; default: Node.get.node (returns each node)
+        default: what to return for the root node; if None, try to use
+                 get.default(root); use none or lambda node: None to actually
+                 return None
+        '''
+        if default is None:
+            default = getattr(wrapped(get), 'default', none)
+        root = default(self), self
+        q = deque([ root ])
+        push, pop = q.append, q.popleft if breadth else q.pop
+        childiter = enumerate if breadth else reversed_enumerate
+        while q:
+            value, node = pop()
+            yield value
+            for i, child in childiter(node.children):
+                push((get(node, i, child, value), Node.cast(child)))
+
+    def __iter__(self):
+        '''same as self.traverse()'''
+        return self.traverse()
+
+
+def until(data, span=S[:], *, sub) -> slice:
+    '''look through data[span] and return the slice that ends with sub'''
+    if isinstance(span, int):
+        span = S[span:]
+    start, stop = span.start, span.stop
+    i = data.find(sub, start, stop)
+    if i >= 0:
+        stop = i + len(sub)
+    elif stop is None:
+        stop = len(data)
+    return S[start:stop]
+
+
+def regex(data, span=S[:], *, pat, last=False, after=False):
+    '''look for regex pat in data[span] and return one such match
+
+    last: return the last match instead of the first (default: False)
+    after: return the end of the match instead of the beginning (default: False)
+    '''
+    if isinstance(span, int):
+        span = S[span:]
+    start = span.start or 0
+
+    match = None
+    for match in re.finditer(pat, data[span]):
+        if not last:
+            break
+
+    if match is None:
+        return start
+
+    i, j = match.span()
+    return start + j if after else start + i
+
+
+def iter_lines(data, pat, last=False, after=False):
+    '''go through the lines in data and yield them and the value in each line
+
+    data: some text
+    pat: the regex that determines where the value starts
+    last: use the last regex match instead of the first
+    after: start after the match instead of at the match
+    '''
+    line = S[0:0]
+    while line.stop < len(data):
+        line = until(data, line.stop, sub=linesep)
+        start = regex(data, line, pat=pat, last=last, after=after)
+        stop = line.stop
+        if data.endswith(linesep, start, line.stop):
+            stop -= len(linesep)
+        yield line, S[start:stop]
+
+
+def pairwise(seq):
+    '''more or less zip(seq, seq[1:])'''
+    seq = iter(seq)
+    try:
+        a = next(seq)
+    except StopIteration:
+        return
+    for b in seq:
+        yield a, b
+        a = b
+
+
+def slices(idx: list[int], obj: Any = S, offset: int = 0):
+    '''convert a sequence of integers into consecutive slices'''
+    for i, j in pairwise(idx):
+        yield obj[S[offset + max(0, i):offset + j]]
+
+
+@dataclass
+class Value:
+    '''values for Node.value in the tree'''
+    prefixes: list[slice]
+    text: slice
+    suffix: slice
+
+
+def get_tree(lines):
+    '''return a tree representation from lines
+
+    lines: an iterator compliant with iter_lines(...)
+    '''
+    root = Node(Value([], S[:0], S[:0]))
+    prefixes, nodes = [ -1 ], [ root ]
+    for line, text in lines:
+        start = text.start - line.start
+        while start <= prefixes[-1]:
+            prefixes.pop()
+            nodes.pop()
+
+        prefixes.append(start)
+        node = Node(Value(
+            list(slices(prefixes, offset=line.start)),
+            text,
+            S[text.stop:line.stop],
+        ))
+        nodes[-1].children.append(node)
+        nodes.append(node)
+    return root
+
+
+def print_tree_as_is(data, root, *, file=stdout):
+    '''print a tree; try to make it look the same as the input'''
+    root_depth = len(root.value.prefixes)
+    for value in root.traverse(get=Node.get.value):  # type: ignore
+        print(
+            *(data[p] for p in value.prefixes[root_depth:]),
+            data[value.text],
+            end=data[value.suffix],
+            sep='',
+            file=file,
+        )
+
+
+@dataclass
+class Theme:
+    '''theme for fancy printing'''
+    prefixes: tuple[str, str, str, str]
+    format: Callable[[str], str] = str
+
+
+THEMES = {
+    'pretty' : Theme(( '├── ', '│   ', '└── ', '    ' )),
+    'thin'   : Theme(( '├── ', '│   ', '└── ', '    ' )),
+    'thick'  : Theme(( '┣━━ ', '┃   ', '┗━━ ', '    ' )),
+    'double' : Theme(( '╠══ ', '║   ', '╚══ ', '    ' )),
+    'rounded': Theme(( '├── ', '│   ', '╰── ', '    ' )),
+    'ascii'  : Theme(( '+-- ', '|   ', '`-- ', '    ' )),
+    'space4' : Theme(( '    ', '    ', '    ', '    ' )),
+    'space2' : Theme(( '  '  , '  '  , '  '  , '  '   )),
+    'space1' : Theme(( ' '   , ' '   , ' '   , ' '    )),
+    'tab'    : Theme(( '\t'  , '\t'  , '\t'  , '\t'   )),
+}
+for name in 'pretty', 'thin', 'thick', 'double', 'rounded', 'ascii':
+    theme = THEMES[name]
+    THEMES[f'dark-{name}'] = Theme(tuple(
+        colored(p, attrs=['dark'])
+        for p in theme.prefixes
+    ), theme.format)
+
+
+def print_tree_with_theme(data, root, theme='pretty', *, file=stdout):
+    '''print a tree with a specific theme'''
+    if isinstance(theme, str):
+        theme = THEMES[theme]
+
+    prefixes = []
+    get = Node.get.depth & Node.get.node & Node.get.is_last
+    for depth, node, is_last in root.traverse(get=get):  # type: ignore
+        prefixes = prefixes[:depth]
+        if prefixes:
+            prefixes[-1] |= 1
+
+        prefixes.append(2 if is_last else 0)
+        print(
+            ''.join(theme.prefixes[p] for p in prefixes[1:]),
+            data[node.value.text],
+            sep='',
+            file=file,
+        )
+
+
+def print_tree(data, root, theme=None, *, show_root=True, file=stdout):
+    '''print a tree, with a theme if theme is not None, otherwise as-is'''
+    if theme is None:
+        print_func = print_tree_as_is
+    else:
+        print_func = partial(print_tree_with_theme, theme=theme)
+
+    if show_root:
+        return print_func(data, root, file=file)
+
+    for child in root.children:
+        print_func(data, child, file=file)
+
+
+def print_json(data, root, *, show_root=True, file=stdout):
+    '''print a tree as JSON
+
+    A child node is an appropriately-escaped string: "value"
+    Any other node is an object of the form {"value":[...children...]}
+    The outermost object is the array of children if show_root is False.
+    '''
+    root = Node.cast(root)
+
+    value = data[root.value.text].encode('unicode-escape').decode().replace(r'"', r'\"')
+    value = f'"{value}"'
+
+    if not root.children:
+        file.write(value)
+        return
+
+    n = len(root.children) - 1
+    if show_root:
+        file.writelines(('{', value, ':'))
+    file.write('[')
+    for i, child in enumerate(root.children):
+        print_json(data, child, file=file)
+        file.write(',' if i < n else ']')
+    if show_root:
+        file.write('}')
+
+
+def print_indices(data, root, *, show_root=True, file=stdout, prefix: tuple = ()):
+    '''print a tree with index codes as prefixes'''
+
+    col = partial(colored, attrs=['dark']) if file.isatty() else lambda x: x
+
+    if not show_root:
+        for i, child in enumerate(root.children):
+            print_indices(data, child, file=file, prefix=pack(*prefix, i))
+        return
+
+    for indices, value in root.traverse(get=Node.get.indices & Node.get.value):
+        print(
+            col(' '.join(f'{i:3}' for i in chain(prefix, indices))),
+            data[value.text],
+            sep='   ' if prefix or indices else '  ',
+            file=file,
+        )
+
+
+parser = ArgumentParser()
+parser.add_argument(
+    'node', nargs='*',
+    help='the index of the subtree'
+)
+parser.add_argument(
+    '-r', '--regex', type=re.compile, default=re.compile(r'[^\s\u2500-\u257f]'),
+    help=r'regex indicate where the value part of the tree begins in the line '
+         r'(default: [^\s\u2500-\u257f] (first non-whitespace non-box-drawing '
+         'character)'
+)
+parser.add_argument(
+    '-a', '--after', action='store_true',
+    help='value begins after the regex match rather than at the regex match'
+)
+parser.add_argument(
+    '-l', '--last', action='store_true',
+    help='use the last regex match on the line instead of the first'
+)
+theming = parser.add_mutually_exclusive_group()
+theming.add_argument(
+    '-t', '--theme', type=str, choices=THEMES.keys(),
+    help='draw the tree using a particular theme'
+)
+theming.add_argument(
+    '-P', '--prefixes', nargs=4, type=str,
+    help='specify the exact prefixes to use; there are four types of '
+         'junctions in a tree: T I L <NONE>; specify them in that order'
+)
+theming.add_argument(
+    '-j', '--json', action='store_true',
+    help='output rudimentary JSON instead of something more readable; the '
+         'output is as dense as it can be; use jq or similar for readability'
+)
+theming.add_argument(
+    '-i', '--indices', action='store_true',
+    help='print indices for prefixes'
+)
+theming.add_argument(
+    '-p', '--pretty', action='store_true',
+    help='alias for --theme pretty'
+)
+showing_root = parser.add_mutually_exclusive_group()
+showing_root.add_argument(
+    '-s', '--show-root', action='store_true',
+    help='always show the root node; by default, it is hidden if no indices '
+         'are passed (note that the root is zero-width empty, so this has no '
+         'effect without some theming argument)'
+)
+showing_root.add_argument(
+    '-S', '--hide-root', action='store_true',
+    help='always hide the root node; by default, it is shown if some indices '
+         'are passed'
+)
+args = parser.parse_args()
+
+if args.theme is not None:
+    theme = args.theme
+elif args.prefixes is not None:
+    theme = Theme(args.prefixes)
+elif args.pretty:
+    theme = 'dark-pretty' if stdout.isatty() else 'pretty'
+else:
+    theme = None
+
+data = stdin.read()
+root = get_tree(iter_lines(
+    data,
+    pat=args.regex,
+    after=args.after,
+    last=args.last,
+))
+try:
+    node = root
+    for idx in args.node:
+        try:
+            idx = int(idx)
+        except ValueError:
+            if idx.startswith('\\'):
+                idx = idx[1:]
+            for i, child in enumerate(node.children):
+                if idx == data[child.value.text]:
+                    idx = i
+                    break
+            else:
+                values = ' '.join(str(data[c.value.text]) for c in node.children)
+                raise ValueError(f'{repr(idx)} not in list: {values}')
+        node = node[idx]
+except (IndexError, ValueError) as e:
+    print(f'subtree: {e}', file=stderr)
+    exit(1)
+
+if args.hide_root:
+    show_root = False
+else:
+    show_root = args.show_root or len(args.node) > 0
+
+if args.json:
+    print_json(data, node, show_root=show_root)
+    if stdout.isatty():
+        stdout.write(linesep)
+    exit(0)
+
+if args.indices:
+    print_indices(data, node, show_root=show_root)
+    exit(0)
+
+print_tree(data, node, theme, show_root=show_root)
