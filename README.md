@@ -3,7 +3,7 @@ manipulate text which is laid out as a tree
 
 # requirements and installation
 
-Needs Python 3.8+ (or so).
+Needs Python 3.8+ (or so) with the `termcolor` package.
 
 Either run `# make install` or put the script in your path manually.
 
