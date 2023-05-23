@@ -448,10 +448,10 @@ parser.add_argument(
     help='the index of the subtree'
 )
 parser.add_argument(
-    '-r', '--regex', type=re.compile, default=re.compile(r'[^\s\u2500-\u257f]'),
-    help=r'regex indicate where the value part of the tree begins in the line '
-         r'(default: [^\s\u2500-\u257f] (first non-whitespace non-box-drawing '
-         'character)'
+    '-r', '--regex', type=re.compile, default=re.compile(r'$|[^\s\u2500-\u257f]'),
+    help=r'regex indicate where the value part of the tree begins in the line; '
+         r'default: $|[^\s\u2500-\u257f] (first non-whitespace non-box-drawing '
+         'character or end of line)'
 )
 parser.add_argument(
     '-a', '--after', action='store_true',
